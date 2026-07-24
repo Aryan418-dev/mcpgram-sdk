@@ -57,7 +57,7 @@ export class Platform {
       },
     });
 
-    const json = await res.json().catch(() => null);
+    const json: any = await res.json().catch(() => null);
 
     // 502 is a deliberate "tool ran but failed" response shape from
     // /api/v1/execute, not a transport-level failure — let it through so
