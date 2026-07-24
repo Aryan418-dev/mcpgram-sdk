@@ -1,16 +1,22 @@
-import { ExecuteResult, ToolDefinition } from "../types";
-import { formatTool } from "../formats";
-import type { ClaudeToolSpec } from "../formats";
+import { ToolDefinition, ExecuteResult } from "../types";
+import { formatTools, ClaudeToolSpec } from "../formats";
+import { PlatformApiError } from "../errors";
 
 /**
  * Claude adapter (Phase 3, step 3).
  *
- * Handles the two things a Claude integration actually needs beyond raw
- * schema translation (step 2):
- *   1. tools ready to drop into `messages.create({ tools })`
- *   2. the round-trip — given the tool_use blocks Claude's response comes
- *      back with, execute each and shape the tool_result blocks to send
- *      back as the next message's content.
+ * Turns a flat tool list into everything needed to hand tools to Claude
+ * and execute whatever it calls back:
+ *
+ *   const claude = await client.forClaude("github");
+ *   const msg = await anthropic.messages.create({
+ *     model: "claude-sonnet-5",
+ *     tools: claude.tools,
+ *     messages: [{ role: "user", content: "List my repos" }],
+ *   });
+ *   const results = await claude.run(msg); // executes any tool_use blocks
+ *   // results is ready to send back as the next user message's content,
+ *   // alongside msg.content if you want the assistant turn preserved too.
  */
 
 export interface ClaudeToolUseBlock {
@@ -28,75 +34,108 @@ export interface ClaudeToolResultBlock {
 }
 
 export interface ClaudeGateway {
-  /** Ready to pass directly as the `tools` param of messages.create(). */
+  /** Tool specs ready to pass directly as `tools` in messages.create(). */
   tools: ClaudeToolSpec[];
   /**
-   * Executes every tool_use block from a Claude response and returns the
-   * tool_result blocks for the next message. Blocks run concurrently;
-   * an unknown tool name or an execution failure produces an
-   * is_error: true result for that block instead of throwing, so one bad
-   * call doesn't take down the others.
+   * Executes every tool_use block found in the input and returns the
+   * matching tool_result blocks, in the same order they were found.
+   *
+   * Accepts either an array of tool_use blocks directly, or a full
+   * Claude response object (anything with a `.content` array) — in
+   * the latter case, non-tool_use content blocks are ignored.
    */
-  run(toolUseBlocks: ClaudeToolUseBlock[]): Promise<ClaudeToolResultBlock[]>;
-  /** Convenience: pulls tool_use blocks out of a full message.content array. */
-  extractToolUse(content: Array<{ type: string; [key: string]: unknown }>): ClaudeToolUseBlock[];
+  run(input: ClaudeToolUseBlock[] | { content: unknown[] }): Promise<ClaudeToolResultBlock[]>;
+  /** Execute a single tool_use block and get back one tool_result block. */
+  runOne(block: ClaudeToolUseBlock): Promise<ClaudeToolResultBlock>;
 }
 
-function stringifyOutput(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
+function isToolUseBlock(block: unknown): block is ClaudeToolUseBlock {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    (block as { type?: unknown }).type === "tool_use" &&
+    typeof (block as { id?: unknown }).id === "string" &&
+    typeof (block as { name?: unknown }).name === "string"
+  );
+}
+
+function extractToolUseBlocks(content: unknown[]): ClaudeToolUseBlock[] {
+  return content.filter(isToolUseBlock);
 }
 
 /**
- * Builds a Claude-ready gateway from a flat tool list plus a call
- * function. Internal building block used by Platform.forClaude() and
- * Toolset.forClaude(); exported directly in case you've sourced a tool
- * list some other way.
+ * Claude's tool_result content must be a string. Objects/arrays get
+ * JSON-stringified; strings pass through untouched; everything else
+ * (numbers, booleans, null) gets coerced.
  */
+function stringifyOutput(output: unknown): string {
+  if (typeof output === "string") return output;
+  if (output === undefined) return "";
+  try {
+    return JSON.stringify(output, null, 2);
+  } catch {
+    return String(output);
+  }
+}
+
 export function buildClaudeGateway(
-  tools: ToolDefinition[],
+  flatTools: ToolDefinition[],
   callFn: (toolId: string, input: Record<string, unknown>) => Promise<ExecuteResult>
 ): ClaudeGateway {
-  const byName = new Map(tools.map((t) => [t.name, t]));
+  const tools = formatTools(flatTools, "claude");
+  const byName = new Map(flatTools.map((t) => [t.name, t] as const));
 
-  return {
-    tools: tools.map((t) => formatTool(t, "claude")),
+  async function runOne(block: ClaudeToolUseBlock): Promise<ClaudeToolResultBlock> {
+    const tool = byName.get(block.name);
 
-    extractToolUse: (content) => content.filter((b): b is ClaudeToolUseBlock => b.type === "tool_use"),
+    if (!tool) {
+      return {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: `Unknown tool "${block.name}". It isn't available in this workspace — check client.use() was scoped correctly, or that the tool wasn't renamed/removed.`,
+        is_error: true,
+      };
+    }
 
-    run: (toolUseBlocks) =>
-      Promise.all(
-        toolUseBlocks.map(async (block): Promise<ClaudeToolResultBlock> => {
-          const tool = byName.get(block.name);
-          if (!tool) {
-            return {
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: `Unknown tool: "${block.name}". This gateway only knows about: ${[...byName.keys()].join(", ") || "(none)"}`,
-              is_error: true,
-            };
-          }
-          try {
-            const result = await callFn(tool.toolId, block.input ?? {});
-            return {
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: stringifyOutput(result.status === "success" ? result.output : result.error),
-              is_error: result.status !== "success",
-            };
-          } catch (err: any) {
-            return {
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: err?.message ?? "Tool execution failed",
-              is_error: true,
-            };
-          }
-        })
-      ),
-  };
+    try {
+      const result = await callFn(tool.toolId, block.input ?? {});
+
+      if (result.status === "error") {
+        return {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: result.error ?? "Tool execution failed with no error message.",
+          is_error: true,
+        };
+      }
+
+      return {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: stringifyOutput(result.output),
+      };
+    } catch (err) {
+      const message =
+        err instanceof PlatformApiError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Tool execution failed.";
+      return {
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: message,
+        is_error: true,
+      };
+    }
+  }
+
+  async function run(
+    input: ClaudeToolUseBlock[] | { content: unknown[] }
+  ): Promise<ClaudeToolResultBlock[]> {
+    const blocks = Array.isArray(input) ? input : extractToolUseBlocks(input.content);
+    return Promise.all(blocks.map(runOne));
+  }
+
+  return { tools, run, runOne };
 }
