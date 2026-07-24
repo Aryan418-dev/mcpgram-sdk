@@ -11,3 +11,5 @@ export type {
 } from "./formats";
 export { buildClaudeGateway } from "./adapters/claude";
 export type { ClaudeGateway, ClaudeToolUseBlock, ClaudeToolResultBlock } from "./adapters/claude";
+export { buildOpenAIGateway } from "./adapters/openai";
+export type { OpenAIGateway, OpenAIToolCall, OpenAIToolResultMessage } from "./adapters/openai";

@@ -1,6 +1,7 @@
 import { ExecuteResult, PlatformOptions, ToolDefinition, Toolset } from "./types";
 import { PlatformApiError } from "./errors";
 import { buildClaudeGateway } from "./adapters/claude";
+import { buildOpenAIGateway } from "./adapters/openai";
 
 interface ToolsApiServer {
   server_id: string;
@@ -130,6 +131,7 @@ export class Platform {
       tools: flatTools,
       call,
       forClaude: () => buildClaudeGateway(flatTools, (toolId, input) => this.call(toolId, input)),
+      forOpenAI: () => buildOpenAIGateway(flatTools, (toolId, input) => this.call(toolId, input)),
     };
   }
 
@@ -143,6 +145,18 @@ export class Platform {
   async forClaude(serverFilter?: string) {
     const flatTools = await this.listTools(serverFilter);
     return buildClaudeGateway(flatTools, (toolId, input) => this.call(toolId, input));
+  }
+
+  /**
+   * Everything an OpenAI Agents / Chat Completions tool-calling loop needs:
+   * tool specs in OpenAI's function-calling format, plus a `run()` that
+   * executes the tool_calls an assistant message comes back with. Pass a
+   * name to scope it to one connector/server (like use()); omit it to
+   * expose every tool in the workspace.
+   */
+  async forOpenAI(serverFilter?: string) {
+    const flatTools = await this.listTools(serverFilter);
+    return buildOpenAIGateway(flatTools, (toolId, input) => this.call(toolId, input));
   }
 
   /** Directly execute a known tool_id (bypasses use() when you already have the ID). */

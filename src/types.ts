@@ -32,6 +32,8 @@ export interface Toolset {
   call(toolNameOrId: string, input?: Record<string, unknown>): Promise<ExecuteResult>;
   /** Scope this toolset down to just what Claude needs — see adapters/claude.ts. */
   forClaude(): import("./adapters/claude").ClaudeGateway;
+  /** Scope this toolset down to just what OpenAI Agents/Chat Completions needs — see adapters/openai.ts. */
+  forOpenAI(): import("./adapters/openai").OpenAIGateway;
 }
 
 export interface PlatformOptions {
