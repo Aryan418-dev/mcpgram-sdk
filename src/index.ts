@@ -9,3 +9,5 @@ export type {
   LangChainToolSpec,
   CrewAIToolSpec,
 } from "./formats";
+export { buildClaudeGateway } from "./adapters/claude";
+export type { ClaudeGateway, ClaudeToolUseBlock, ClaudeToolResultBlock } from "./adapters/claude";

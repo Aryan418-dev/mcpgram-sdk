@@ -1,5 +1,6 @@
 import { ExecuteResult, PlatformOptions, ToolDefinition, Toolset } from "./types";
 import { PlatformApiError } from "./errors";
+import { buildClaudeGateway } from "./adapters/claude";
 
 interface ToolsApiServer {
   server_id: string;
@@ -18,7 +19,7 @@ interface ToolsApiServer {
  * endpoints every native connector and external MCP server is exposed
  * through uniformly:
  *
- *   GET  /api/v1/tools?server=<name>   — discover tools (client.use)
+ *   GET  /api/v1/tools?server=<name>   — discover tools (client.use, client.forClaude)
  *   POST /api/v1/execute                — run a tool (client.call)
  *
  * Usage:
@@ -74,6 +75,27 @@ export class Platform {
   }
 
   /**
+   * Fetches the flat tool list for the workspace, optionally filtered by
+   * a case-insensitive substring match against server display names.
+   * Shared by use() and forClaude() so there's one code path for turning
+   * the /api/v1/tools response into ToolDefinition[].
+   */
+  private async listTools(serverFilter?: string): Promise<ToolDefinition[]> {
+    const query = serverFilter ? `?server=${encodeURIComponent(serverFilter)}` : "";
+    const json = await this.request<{ servers: ToolsApiServer[] }>(`/api/v1/tools${query}`);
+    const servers = json.servers ?? [];
+
+    return servers.flatMap((server) =>
+      server.tools.map((t) => ({
+        toolId: t.tool_id,
+        name: t.name,
+        description: t.description,
+        inputSchema: t.input_schema,
+      }))
+    );
+  }
+
+  /**
    * Resolve tools for a connector or MCP server by name (case-insensitive
    * substring match against the server's display name — e.g. "github"
    * matches the native connector "GitHub (native)", or any external MCP
@@ -84,38 +106,43 @@ export class Platform {
    * server under the hood).
    */
   async use(name: string): Promise<Toolset> {
-    const json = await this.request<{ servers: ToolsApiServer[] }>(
-      `/api/v1/tools?server=${encodeURIComponent(name)}`
-    );
-
-    const servers = json.servers ?? [];
-    if (servers.length === 0) {
+    const flatTools = await this.listTools(name);
+    if (flatTools.length === 0) {
       throw new Error(
         `No connected server or connector matches "${name}". Check the name against your workspace's dashboard.`
       );
     }
 
-    const flatTools = servers.flatMap((server) =>
-      server.tools.map((t) => ({
-        toolId: t.tool_id,
-        name: t.name,
-        description: t.description,
-        inputSchema: t.input_schema,
-      }))
-    );
+    const byKey = new Map(flatTools.map((t) => [t.toolId, t] as const));
+    const byName = new Map(flatTools.map((t) => [t.name, t] as const));
+
+    const call = (toolNameOrId: string, input: Record<string, unknown> = {}) => {
+      const match = byKey.get(toolNameOrId) ?? byName.get(toolNameOrId);
+      if (!match) {
+        const available = flatTools.map((t) => t.name).join(", ") || "(none)";
+        throw new Error(`Tool "${toolNameOrId}" not found in "${name}". Available tools: ${available}`);
+      }
+      return this.call(match.toolId, input);
+    };
 
     return {
       query: name,
       tools: flatTools,
-      call: (toolNameOrId: string, input: Record<string, unknown> = {}) => {
-        const match = flatTools.find((t) => t.toolId === toolNameOrId || t.name === toolNameOrId);
-        if (!match) {
-          const available = flatTools.map((t) => t.name).join(", ") || "(none)";
-          throw new Error(`Tool "${toolNameOrId}" not found in "${name}". Available tools: ${available}`);
-        }
-        return this.call(match.toolId, input);
-      },
+      call,
+      forClaude: () => buildClaudeGateway(flatTools, (toolId, input) => this.call(toolId, input)),
     };
+  }
+
+  /**
+   * Everything Claude needs to call tools in this workspace: tool specs
+   * in Anthropic's tool-use format, ready for `messages.create({ tools })`,
+   * plus a `run()` that executes the tool_use blocks Claude's response
+   * comes back with. Pass a name to scope it to one connector/server
+   * (like use()); omit it to expose every tool in the workspace.
+   */
+  async forClaude(serverFilter?: string) {
+    const flatTools = await this.listTools(serverFilter);
+    return buildClaudeGateway(flatTools, (toolId, input) => this.call(toolId, input));
   }
 
   /** Directly execute a known tool_id (bypasses use() when you already have the ID). */

@@ -30,6 +30,8 @@ export interface Toolset {
   tools: ToolDefinition[];
   /** Call a tool in this toolset by its name or tool_id. */
   call(toolNameOrId: string, input?: Record<string, unknown>): Promise<ExecuteResult>;
+  /** Scope this toolset down to just what Claude needs — see adapters/claude.ts. */
+  forClaude(): import("./adapters/claude").ClaudeGateway;
 }
 
 export interface PlatformOptions {
